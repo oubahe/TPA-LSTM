@@ -1,0 +1,149 @@
+import os
+import logging
+import numpy as np
+from tensorflow.keras import losses
+import tensorflow.keras.backend as K
+from tempfile import TemporaryDirectory
+from tensorflow.keras import regularizers
+from tensorflow.keras.models import Model
+from tensorflow.keras import optimizers
+from tensorflow.keras.models import load_model
+from tensorflow.keras.layers import Input, Conv1D, Reshape, Lambda, Flatten
+from tensorflow.keras.layers import Layer, Dense, LSTM, Activation, Multiply, Add
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+
+class CalculateScoreMatrix(Layer):
+    def __init__(self, output_dim=None, **kwargs):
+        self.output_dim = output_dim
+        super(CalculateScoreMatrix, self).__init__(**kwargs)
+
+    def get_config(self):
+        config = super().get_config().copy()
+        config.update({
+            'output_dim': self.output_dim,
+        })
+        return config
+
+    def build(self, input_shape):
+        self.kernel = self.add_weight(name='kernel',
+                                 shape=(input_shape[-1], self.output_dim),
+                                 initializer='uniform',
+                                 trainable=True)
+        super(CalculateScoreMatrix, self).build(input_shape)
+
+    def call(self, x):
+        res = K.dot(x, self.kernel)
+        return res
+
+    # def compute_output_shape(self, input_shape):
+    #     return (input_shape[0], self.output_dim)  # 指定输出维度
+
+class TPALSTM_Model:
+    def __init__(self, hidden_unit=32, filter_size=3, batch_size=32, epochs=50, learning_rate=1.2e-3):
+        self.epochs = epochs
+        self.feat_dim = None
+        self.input_dim = None
+        self.output_dim = None
+        self.lr = learning_rate
+        self.filters = hidden_unit
+        self.batch_size = batch_size
+        self.units = hidden_unit * 2
+        self.model_name = "TPA-LSTM"
+        self.filter_size = filter_size
+        self.learning_rate = learning_rate
+        self.loss_fn = losses.mean_squared_error
+        self._estimators = {}
+
+    def build_model(self):
+        inp = Input(shape=(self.input_dim, self.feat_dim))
+        # convolution layer
+        x = Conv1D(filters=self.filters, kernel_size=self.filter_size, strides=1, padding="causal")(inp)
+        # LSTM layer
+        x = LSTM(units=self.units,
+                 kernel_initializer="glorot_uniform",
+                 bias_initializer="zeros",
+                 kernel_regularizer=regularizers.l2(0.001),
+                 return_sequences=True)(x)
+        # get the 1~t-1 and t hidden state
+        H = Lambda(lambda x: x[:, :-1, :])(x)
+        ht = Lambda(lambda x: x[:, -1, :])(x)
+        ht = Reshape((self.units, 1))(ht)
+        # get the HC by 1*1 convolution
+        HC = Lambda(lambda x: K.permute_dimensions(x, [0, 2, 1]))(H)
+        score_mat = CalculateScoreMatrix(self.units)(HC)
+        score_mat = Lambda(lambda x: K.batch_dot(x[0], x[1]))([score_mat, ht])
+        # get the attn matrix
+        score_mat = Activation("sigmoid")(score_mat)
+        attn_mat = Multiply()([HC, score_mat])
+        attn_vec = Lambda(lambda x: K.sum(x, axis=-1))(attn_mat)
+        # get the final prediction
+        wvt = Dense(units=self.filters * 4, activation=None)(attn_vec)
+        wht = Dense(units=self.filters * 4, activation=None)(Flatten()(ht))
+        yht = Add()([wht, wvt])
+        # get the output
+        out = Dense(self.output_dim, activation="sigmoid")(yht)
+        # compile
+        model = Model(inputs=inp, outputs=out)
+        optimizer = optimizers.Nadam(learning_rate=self.lr)
+        model.compile(loss=self.loss_fn, optimizer=optimizer)
+        return model
+
+    def fit(self, x_train, y_train, x_val, y_val):
+        import tensorflow as tf
+        import os
+        gpus = tf.config.experimental.list_physical_devices(device_type='GPU')
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+        # get the dimension of input
+        _, input_dim, feat_dim = x_train.shape
+        _, output_dim = y_train.shape
+        self.input_dim = input_dim
+        self.feat_dim = feat_dim
+        self.output_dim = output_dim
+        # build the model
+        my_model = self.build_model()
+        # train the model
+        sample_weight_train = np.array([_ for _ in range(1, len(x_train) + 1)]) / len(x_train)
+        with TemporaryDirectory() as tmp_dir:
+            model_path = os.path.join(tmp_dir, self.model_name + ".h5")
+            my_model.fit(x_train, y_train,
+                         batch_size=self.batch_size,
+                         epochs=self.epochs,
+                         verbose=2,
+                         sample_weight=sample_weight_train,
+                         validation_data=(x_val, y_val),
+                         callbacks=[ReduceLROnPlateau(monitor="val_loss", factor=0.8, patience=1),
+                                    EarlyStopping(monitor="val_loss", min_delta=2e-5, patience=8, mode="auto"),
+                                    ModelCheckpoint(filepath=model_path, monitor='val_loss', verbose=1,
+                                                    save_best_only=True, mode="auto", save_weights_only=False)])
+            with open(model_path, "rb") as f:
+                self._estimators[self.model_name] = f.read()
+                f.close()
+        # save the every model
+        logging.info(f"TPA-LSTM model is saved. ")
+        # clear the session and memory
+        K.clear_session()
+        pass
+
+    def predict(self, x_test):
+        # select the GPU environment to forecast
+        import tensorflow as tf
+        import os
+        gpus = tf.config.experimental.list_physical_devices(device_type='GPU')
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+        # load the model
+        pickled_model = self._estimators[self.model_name]
+        with TemporaryDirectory() as tmp_dir:
+            filepath = os.path.join(tmp_dir, "model.h5")
+            with open(filepath, "wb") as f:
+                f.write(pickled_model)
+                f.close()
+            trained_model = load_model(filepath, custom_objects={"CalculateScoreMatrix": CalculateScoreMatrix})
+        logging.info(f"The trained model is loaded. ")
+        pred_result = trained_model.predict(x_test)
+        pred_result[pred_result < 0] = 0
+        logging.info(f"The forecast result is got. ")
+        return pred_result
