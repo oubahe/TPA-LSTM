@@ -1,0 +1,77 @@
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import mean_squared_error
+from TPA_LSTM.tpa_lstm import TPALSTM_Model
+
+def get_timeseries_input(data, window_size, sample_step, forecast_horizon, target_index,
+                         multivariate_output=False, shuffle=False, other_horizon=None):
+    '''
+    :param data: np.array, shape (n_Samples, n_features) or (M, n_samples, n_features)
+    :param sample_step: int, Time gap for sampling
+    :param window_size: int, Fixed size of the look-back
+    :param target_index: int, Column index of forecast target
+    :param forecast_horizon: int, Forecasting horizon, the number of future steps that have to be forecasted
+    :param multivariate_output: bool, if True the target array will not have shape, shape (n_samples, output_sequence_len) or (n_samples, output_sequence_len, n_features)
+    :param shuffle: if True shuffle the data on the first axis
+    :param other_horizon: None
+    :return: tuple, the input and the target array for the training model
+    '''
+    if data.ndim == 2:
+        data = np.expand_dims(data, 0)
+    inputs = []
+    targets = []
+    for X in tqdm(data):
+        n_used_samples = X.shape[0] - forecast_horizon - window_size - sample_step + 1
+        for i in range(0, n_used_samples, sample_step):
+            inputs.append(X[i: i+window_size])
+            if multivariate_output:
+                if other_horizon is None:
+                    targets.append(X[i+window_size : i+window_size+forecast_horizon])
+                else:
+                    targets.append(X[i+1:i+window_size+1])
+            else:
+                if other_horizon is None:
+                    targets.append(X[i+window_size:i+window_size+forecast_horizon, target_index])
+                else:
+                    targets.append(X[i+1:i+window_size+1, target_index])
+    encoder_input_data = np.asarray(inputs)
+    encoder_target_data = np.asarray(targets)
+    idxs = np.arange(encoder_input_data.shape[0])
+    if shuffle:
+        np.random.shuffle(idxs)
+    return encoder_input_data[idxs], encoder_target_data[idxs]
+
+if __name__ == '__main__':
+    import pandas as pd
+    # 这里因为数据需要保密，暂不提供本地测试数据，各位同学可以使用自己的数据进行测试
+    data = pd.read_csv("./horizon_data.csv", header=0, index_col=0)
+    data = data.values[:]
+    data = (lambda x: x/1600)(data)[:3000]
+    x, y = get_timeseries_input(data, window_size=96*5, sample_step=4, forecast_horizon=32, target_index=0)
+    train_ratio, val_ratio = 0.9, 0.1
+    train_index = int(len(x) * train_ratio)
+    val_index = int(len(x) * (train_ratio + val_ratio))
+
+    # get the train, val, test set
+    x_train, y_train = x[:train_index], y[:train_index]
+    x_val, y_val = x[train_index:-30], y[train_index:-30]
+    x_test, y_test = x[-30:], y[-30:]
+
+    my_model = TPALSTM_Model()
+    my_model.fit(x_train, y_train, x_val, y_val)
+
+    # forecast
+    pred_result = my_model.predict(x_test).ravel()
+
+    # get the final result
+    y_test = y_test * 1600
+    pred_result = pred_result * 1600
+    print("Prediction RMSE: ", np.sqrt(mean_squared_error(y_test.ravel(), pred_result)))
+
+    ### VISUALIZE TEST PREDICTIONS ###
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 6))
+    plt.plot(pred_result[:], label='prediction')
+    plt.plot(y_test.ravel()[:], label='true')
+    plt.legend()
+    plt.show()
